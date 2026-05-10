@@ -14,8 +14,6 @@ if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
 app.use(express.json());
 
 // ─── Concurrency queue ────────────────────────────────────────────────────────
-// Railway free tier has ~512MB RAM. One FFmpeg encode can peak at 200-400MB.
-// Running multiple in parallel causes SIGKILL. We serialize all jobs.
 const MAX_CONCURRENT = 1;
 let activeJobs = 0;
 const jobQueue = [];
@@ -46,18 +44,28 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     service: 'ffmpeg-service',
-    version: '11.0.0',
+    version: '12.0.0',
     queue: { active: activeJobs, waiting: jobQueue.length }
   });
 });
 
 function runFFmpeg(inputPath, outputPath, res, ts) {
-  const inputSize = fs.statSync(inputPath).size;
+  // Защита: файл должен существовать и не быть пустым
+  let inputSize;
+  try {
+    inputSize = fs.statSync(inputPath).size;
+  } catch (e) {
+    console.error(`[${ts}] input file missing: ${e.message}`);
+    if (!res.headersSent) res.status(500).json({ error: 'input file missing', detail: e.message });
+    return Promise.resolve();
+  }
+
   console.log(`[${ts}] input: ${(inputSize / 1024 / 1024).toFixed(1)} MB`);
 
   if (inputSize === 0) {
     cleanup(inputPath);
-    return Promise.resolve(res.status(400).json({ error: 'empty input file' }));
+    if (!res.headersSent) res.status(400).json({ error: 'empty input file' });
+    return Promise.resolve();
   }
 
   const vf = 'scale=-2:1920,crop=1080:1920';
@@ -77,9 +85,9 @@ function runFFmpeg(inputPath, outputPath, res, ts) {
     outputPath
   ];
 
-  console.log(`[${ts}] starting ffmpeg... (active jobs: ${activeJobs})`);
+  console.log(`[${ts}] starting ffmpeg... (active: ${activeJobs}, waiting: ${jobQueue.length})`);
 
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     execFile('ffmpeg', args, {
       maxBuffer: 100 * 1024 * 1024,
       timeout: 5 * 60 * 1000
@@ -100,18 +108,27 @@ function runFFmpeg(inputPath, outputPath, res, ts) {
         return resolve();
       }
 
-      if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size === 0) {
-        cleanup(outputPath);
-        if (!res.headersSent) res.status(500).json({ error: 'output empty or missing' });
+      let outputSize;
+      try {
+        outputSize = fs.statSync(outputPath).size;
+      } catch (e) {
+        console.error(`[${ts}] output file missing after ffmpeg: ${e.message}`);
+        if (!res.headersSent) res.status(500).json({ error: 'output missing after ffmpeg' });
         return resolve();
       }
 
-      const outputSize = fs.statSync(outputPath).size;
+      if (outputSize === 0) {
+        cleanup(outputPath);
+        if (!res.headersSent) res.status(500).json({ error: 'output is empty' });
+        return resolve();
+      }
+
       console.log(`[${ts}] output: ${(outputSize / 1024 / 1024).toFixed(1)} MB`);
 
       fs.readFile(outputPath, (readErr, data) => {
         cleanup(outputPath);
         if (readErr) {
+          console.error(`[${ts}] read error: ${readErr.message}`);
           if (!res.headersSent) res.status(500).json({ error: 'read failed' });
           return resolve();
         }
@@ -129,6 +146,7 @@ function runFFmpeg(inputPath, outputPath, res, ts) {
   });
 }
 
+// ─── POST /process — raw binary body ─────────────────────────────────────────
 app.post('/process', (req, res) => {
   const ts = Date.now();
   const inputPath = path.join(TMP_DIR, `in_${ts}.mp4`);
@@ -150,6 +168,7 @@ app.post('/process', (req, res) => {
   });
 });
 
+// ─── POST /process-url — Railway downloads the file itself ───────────────────
 app.post('/process-url', (req, res) => {
   const { url } = req.body;
 
@@ -161,34 +180,50 @@ app.post('/process-url', (req, res) => {
   const inputPath = path.join(TMP_DIR, `in_${ts}.mp4`);
   const outputPath = path.join(TMP_DIR, `out_${ts}.mp4`);
 
-  console.log(`[${ts}] /process-url — downloading: ${url} (queue: ${jobQueue.length} waiting)`);
+  console.log(`[${ts}] /process-url — downloading: ${url.slice(0, 80)}... (queue: ${jobQueue.length} waiting)`);
 
   const doDownload = (targetUrl, redirectCount = 0) => {
-    if (redirectCount > 5) {
+    if (redirectCount > 10) {
       cleanup(inputPath);
       if (!res.headersSent) res.status(500).json({ error: 'Too many redirects' });
       return;
     }
 
-    const protocol = targetUrl.startsWith('https') ? https : http;
+    let protocol;
+    try {
+      protocol = targetUrl.startsWith('https') ? https : http;
+    } catch (e) {
+      cleanup(inputPath);
+      if (!res.headersSent) res.status(400).json({ error: 'Invalid URL', detail: e.message });
+      return;
+    }
 
-    protocol.get(targetUrl, (response) => {
+    const request = protocol.get(targetUrl, (response) => {
+      // Follow redirects
       if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-        console.log(`[${ts}] redirect → ${response.headers.location}`);
+        console.log(`[${ts}] redirect (${response.statusCode}) → ${response.headers.location.slice(0, 80)}`);
+        response.resume(); // drain the response before following redirect
         return doDownload(response.headers.location, redirectCount + 1);
       }
 
       if (response.statusCode !== 200) {
+        response.resume();
         cleanup(inputPath);
         if (!res.headersSent) res.status(502).json({ error: `Upstream returned ${response.statusCode}` });
         return;
       }
 
       const writeStream = fs.createWriteStream(inputPath);
-      response.pipe(writeStream);
+
+      response.on('error', (err) => {
+        console.error(`[${ts}] response stream error:`, err.message);
+        cleanup(inputPath);
+        if (!res.headersSent) res.status(500).json({ error: 'response stream failed', detail: err.message });
+      });
 
       writeStream.on('error', (err) => {
-        console.error(`[${ts}] download write error:`, err.message);
+        console.error(`[${ts}] write stream error:`, err.message);
+        response.destroy();
         cleanup(inputPath);
         if (!res.headersSent) res.status(500).json({ error: 'download write failed', detail: err.message });
       });
@@ -197,10 +232,21 @@ app.post('/process-url', (req, res) => {
         console.log(`[${ts}] download complete, queuing ffmpeg...`);
         enqueueJob(() => runFFmpeg(inputPath, outputPath, res, ts));
       });
-    }).on('error', (err) => {
-      console.error(`[${ts}] download error:`, err.message);
+
+      response.pipe(writeStream);
+    });
+
+    request.on('error', (err) => {
+      console.error(`[${ts}] request error:`, err.message);
       cleanup(inputPath);
       if (!res.headersSent) res.status(500).json({ error: 'download failed', detail: err.message });
+    });
+
+    request.setTimeout(60000, () => {
+      console.error(`[${ts}] download timeout`);
+      request.destroy();
+      cleanup(inputPath);
+      if (!res.headersSent) res.status(504).json({ error: 'download timeout' });
     });
   };
 
@@ -209,12 +255,23 @@ app.post('/process-url', (req, res) => {
 
 function cleanup(...paths) {
   for (const p of paths) {
-    try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch {}
+    try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch (e) {
+      console.warn(`cleanup failed for ${p}: ${e.message}`);
+    }
   }
 }
 
+// Глобальный обработчик — предотвращает краш процесса при любой необработанной ошибке
+process.on('uncaughtException', (err) => {
+  console.error('uncaughtException:', err.message, err.stack);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('unhandledRejection:', reason);
+});
+
 app.listen(PORT, () => {
-  console.log(`ffmpeg-service v11 listening on port ${PORT}`);
+  console.log(`ffmpeg-service v12 listening on port ${PORT}`);
   console.log(`Max concurrent FFmpeg jobs: ${MAX_CONCURRENT}`);
   console.log(`tmp dir: ${TMP_DIR}`);
 });
