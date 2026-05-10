@@ -10,19 +10,18 @@ const TMP_DIR = path.join(__dirname, 'tmp');
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'ffmpeg-service', version: '7.0.0' });
+  res.json({ status: 'ok', service: 'ffmpeg-service', version: '8.0.0' });
 });
 
 /**
  * POST /process
  * Body: raw binary video
- * Returns: MP4 1080x1920 (9:16, 1.3x zoom, top banner blurred, black bars reduced)
+ * Returns: MP4 1080x1920 (9:16, fills full frame, sides cropped, top banners blurred)
  *
  * Filter pipeline:
- * 1. Blur top 15% of original (covers corner banners)
- * 2. Scale up by 1.3x (zoom in, crops edges)
- * 3. Crop center to original dimensions
- * 4. Scale + pad to 1080x1920 (9:16)
+ * 1. Blur top 12% of original (covers corner banners on Twitch streams)
+ * 2. Scale by height to 1920px (fills vertically, width becomes ~3413px for 16:9)
+ * 3. Crop center 1080px wide → full 9:16 frame, no black bars
  */
 app.post('/process', (req, res) => {
   const ts = Date.now();
@@ -49,21 +48,16 @@ app.post('/process', (req, res) => {
       return res.status(400).json({ error: 'empty input file' });
     }
 
-    // Filter graph:
-    // 1. Split original into two streams
-    // 2. Blur top 15% of original → [blurred_top]
-    // 3. Overlay blurred_top onto original → [with_blur]
-    // 4. Scale up 1.3x → [zoomed]
-    // 5. Crop center back to original size → [cropped]
-    // 6. Scale + pad to 1080x1920 (9:16) → [out]
-    const ZOOM = 1.3;
+    // Filter:
+    // 1. split → blur top 12% → overlay back
+    // 2. scale to height=1920, keep aspect (width will be ~3413 for 16:9 source)
+    // 3. crop 1080 wide from center → perfect 1080x1920 with no black bars
     const vf = [
       `[0:v]split=2[base][blur_src]`,
-      `[blur_src]crop=iw:ih*0.15:0:0,boxblur=25:5[blurred_top]`,
+      `[blur_src]crop=iw:ih*0.12:0:0,boxblur=30:6[blurred_top]`,
       `[base][blurred_top]overlay=0:0[with_blur]`,
-      `[with_blur]scale=iw*${ZOOM}:ih*${ZOOM}[zoomed]`,
-      `[zoomed]crop=iw/${ZOOM}:ih/${ZOOM}[cropped]`,
-      `[cropped]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black[out]`
+      `[with_blur]scale=-2:1920[scaled]`,
+      `[scaled]crop=1080:1920[out]`
     ].join(';');
 
     const args = [
@@ -82,7 +76,7 @@ app.post('/process', (req, res) => {
       outputPath
     ];
 
-    console.log(`[${ts}] starting ffmpeg (blur + 1.3x zoom)...`);
+    console.log(`[${ts}] starting ffmpeg (fill 9:16, blur banners)...`);
 
     execFile('ffmpeg', args, {
       maxBuffer: 100 * 1024 * 1024,
@@ -139,6 +133,6 @@ function cleanup(...paths) {
 }
 
 app.listen(PORT, () => {
-  console.log(`ffmpeg-service v7 listening on port ${PORT}`);
+  console.log(`ffmpeg-service v8 listening on port ${PORT}`);
   console.log(`tmp dir: ${TMP_DIR}`);
 });

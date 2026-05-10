@@ -1,7 +1,7 @@
 {
   "name": "ffmpeg-service",
-  "version": "7.0.0",
-  "description": "FFmpeg: blur top banners + 1.3x zoom + 9:16",
+  "version": "8.0.0",
+  "description": "FFmpeg: fill 9:16 by height + crop sides + blur top banners",
   "main": "index.js",
   "scripts": { "start": "node index.js" },
   "dependencies": { "express": "^4.18.2" }
