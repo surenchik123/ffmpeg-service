@@ -1,94 +1,98 @@
 const express = require('express');
-const { execFile } = require('child_process');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
+const { spawn } = require('child_process');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'ffmpeg-service' });
+  res.json({ status: 'ok', service: 'ffmpeg-service', version: '4.0.0' });
 });
 
 /**
  * POST /process
- * Body: raw binary video (any format ffmpeg supports)
- * Returns: processed MP4 1080x1920 (9:16, black bars)
+ * Body: raw binary video
+ * Returns: MP4 1080x1920 (9:16, black bars)
+ *
+ * ffmpeg reads from stdin (-i pipe:0) and writes to stdout (pipe:1)
+ * No temp files needed — works within Railway's constraints
  */
 app.post('/process', (req, res) => {
-  const tmpDir = os.tmpdir();
-  const ts = Date.now();
-  const inputPath = path.join(tmpDir, `in_${ts}.mp4`);
-  const outputPath = path.join(tmpDir, `out_${ts}.mp4`);
+  console.log('[ffmpeg] starting pipe processing...');
 
-  const writeStream = fs.createWriteStream(inputPath);
-  req.pipe(writeStream);
+  const args = [
+    '-loglevel', 'error',
+    '-i', 'pipe:0',                    // читаем из stdin
+    '-vf', 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black',
+    '-c:v', 'libx264',
+    '-preset', 'fast',
+    '-crf', '23',
+    '-c:a', 'aac',
+    '-b:a', '128k',
+    '-movflags', 'frag_keyframe+empty_moov+faststart', // нужно для pipe output (не seekable)
+    '-f', 'mp4',
+    'pipe:1'                           // пишем в stdout
+  ];
 
-  writeStream.on('error', (err) => {
-    console.error('[write] error:', err);
-    cleanup(inputPath, outputPath);
-    if (!res.headersSent) res.status(500).json({ error: 'Failed to write input' });
+  const ff = spawn('ffmpeg', args);
+
+  let headersSent = false;
+  let errOutput = '';
+
+  // Собираем stderr для логов
+  ff.stderr.on('data', (chunk) => {
+    errOutput += chunk.toString();
   });
 
-  writeStream.on('finish', () => {
-    const stat = fs.statSync(inputPath);
-    console.log(`[ffmpeg] input: ${(stat.size / 1024 / 1024).toFixed(1)} MB`);
+  // Как только первые байты выходят — отправляем заголовки и начинаем стримить
+  ff.stdout.on('data', (chunk) => {
+    if (!headersSent) {
+      headersSent = true;
+      res.setHeader('Content-Type', 'video/mp4');
+      res.setHeader('Content-Disposition', 'attachment; filename="output.mp4"');
+      res.setHeader('Connection', 'close');
+      console.log('[ffmpeg] first bytes received, streaming to client...');
+    }
+    res.write(chunk);
+  });
 
-    const args = [
-      '-y',
-      '-i', inputPath,
-      '-vf', 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black',
-      '-c:v', 'libx264',
-      '-preset', 'fast',
-      '-crf', '23',
-      '-c:a', 'aac',
-      '-b:a', '128k',
-      '-movflags', '+faststart',
-      outputPath
-    ];
+  ff.stdout.on('end', () => {
+    console.log('[ffmpeg] stdout ended');
+    res.end();
+  });
 
-    execFile('ffmpeg', args, { maxBuffer: 50 * 1024 * 1024 }, (err, _stdout, stderr) => {
-      cleanup(inputPath);
-
-      if (err) {
-        console.error('[ffmpeg] failed:', stderr.slice(-1000));
-        cleanup(outputPath);
-        if (!res.headersSent) res.status(500).json({ error: 'ffmpeg failed', detail: stderr.slice(-500) });
-        return;
+  ff.on('close', (code) => {
+    console.log(`[ffmpeg] exited with code ${code}`);
+    if (code !== 0) {
+      console.error('[ffmpeg] stderr:', errOutput.slice(-2000));
+      if (!headersSent) {
+        res.status(500).json({ error: 'ffmpeg failed', code, detail: errOutput.slice(-500) });
       }
+    }
+  });
 
-      const outStat = fs.statSync(outputPath);
-      console.log(`[ffmpeg] output: ${(outStat.size / 1024 / 1024).toFixed(1)} MB`);
+  ff.on('error', (err) => {
+    console.error('[ffmpeg] spawn error:', err);
+    if (!headersSent) {
+      res.status(500).json({ error: 'Failed to start ffmpeg', detail: err.message });
+    }
+  });
 
-      // Читаем файл в память и отправляем как буфер — избегаем проблем с потоками в n8n
-      fs.readFile(outputPath, (readErr, data) => {
-        cleanup(outputPath);
+  // Пайпим входящий запрос прямо в stdin ffmpeg
+  req.pipe(ff.stdin);
 
-        if (readErr) {
-          console.error('[read] error:', readErr);
-          if (!res.headersSent) res.status(500).json({ error: 'Failed to read output' });
-          return;
-        }
+  req.on('error', (err) => {
+    console.error('[req] error:', err);
+    ff.kill();
+  });
 
-        res.set({
-          'Content-Type': 'video/mp4',
-          'Content-Disposition': 'attachment; filename="output.mp4"',
-          'Content-Length': data.length,
-          'Connection': 'close'
-        });
-        res.end(data);
-      });
-    });
+  ff.stdin.on('error', (err) => {
+    // EPIPE — нормально если ffmpeg завершился раньше
+    if (err.code !== 'EPIPE') {
+      console.error('[stdin] error:', err);
+    }
   });
 });
 
-function cleanup(...paths) {
-  for (const p of paths) {
-    try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch {}
-  }
-}
-
 app.listen(PORT, () => {
-  console.log(`ffmpeg-service v3 listening on port ${PORT}`);
+  console.log(`ffmpeg-service v4 listening on port ${PORT}`);
 });
