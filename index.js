@@ -1,5 +1,4 @@
 const express = require('express');
-const multer = require('multer');
 const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -8,93 +7,73 @@ const os = require('os');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Multer: принимаем video + srt, до 500MB
-const upload = multer({
-  dest: os.tmpdir(),
-  limits: { fileSize: 500 * 1024 * 1024 }
-});
-
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'ffmpeg-service' });
 });
 
 /**
  * POST /process
- * multipart/form-data:
- *   - video: видеофайл (mp4, mkv, etc.)
- *   - srt:   субтитры (.srt)
+ * Content-Type: video/mp4 (или любой video/*)
+ * Body: raw binary video file
  *
- * Возвращает обработанный MP4 (9:16, субтитры вшиты, чёрные полосы)
+ * Возвращает MP4 1080x1920 (9:16, чёрные полосы)
  */
-app.post('/process', upload.fields([
-  { name: 'video', maxCount: 1 },
-  { name: 'srt', maxCount: 1 }
-]), async (req, res) => {
-  const videoFile = req.files?.video?.[0];
-  const srtFile   = req.files?.srt?.[0];
-
-  if (!videoFile) {
-    return res.status(400).json({ error: 'video file is required' });
-  }
-
-  const tmpDir    = os.tmpdir();
-  const inputPath = videoFile.path;
+app.post('/process', (req, res) => {
+  const tmpDir = os.tmpdir();
+  const inputPath = path.join(tmpDir, `in_${Date.now()}.mp4`);
   const outputPath = path.join(tmpDir, `out_${Date.now()}.mp4`);
 
-  // Если srt передан — переименуем с расширением чтобы ffmpeg понял
-  let srtPath = null;
-  if (srtFile) {
-    srtPath = path.join(tmpDir, `sub_${Date.now()}.srt`);
-    fs.renameSync(srtFile.path, srtPath);
-  }
+  // Пишем входящий поток в файл
+  const writeStream = fs.createWriteStream(inputPath);
+  req.pipe(writeStream);
 
-  // ffmpeg filter:
-  // 1. scale=1080:1920 с сохранением пропорций
-  // 2. pad до 1080x1920 с чёрными полосами по центру
-  // 3. subtitles= (если есть srt)
-  const scaleAndPad = 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black';
-  const vf = srtPath
-    ? `${scaleAndPad},subtitles='${srtPath.replace(/'/g, "'\\''")}':force_style='FontSize=18,PrimaryColour=&HFFFFFF,Outline=2'`
-    : scaleAndPad;
+  writeStream.on('error', (err) => {
+    console.error('[write] error:', err);
+    res.status(500).json({ error: 'Failed to write input file' });
+  });
 
-  const args = [
-    '-y',
-    '-i', inputPath,
-    '-vf', vf,
-    '-c:v', 'libx264',
-    '-preset', 'fast',
-    '-crf', '23',
-    '-c:a', 'aac',
-    '-b:a', '128k',
-    '-movflags', '+faststart',
-    outputPath
-  ];
+  writeStream.on('finish', () => {
+    const stat = fs.statSync(inputPath);
+    console.log(`[ffmpeg] input size: ${(stat.size / 1024 / 1024).toFixed(1)} MB`);
 
-  console.log(`[ffmpeg] starting: ${args.join(' ')}`);
+    const args = [
+      '-y',
+      '-i', inputPath,
+      '-vf', 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black',
+      '-c:v', 'libx264',
+      '-preset', 'fast',
+      '-crf', '23',
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      '-movflags', '+faststart',
+      outputPath
+    ];
 
-  execFile('ffmpeg', args, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
-    // Чистим входные файлы
-    try { fs.unlinkSync(inputPath); } catch {}
-    if (srtPath) try { fs.unlinkSync(srtPath); } catch {}
+    console.log(`[ffmpeg] starting...`);
 
-    if (err) {
-      console.error('[ffmpeg] error:', stderr);
-      return res.status(500).json({ error: 'ffmpeg failed', details: stderr.slice(-2000) });
-    }
+    execFile('ffmpeg', args, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
+      try { fs.unlinkSync(inputPath); } catch {}
 
-    console.log('[ffmpeg] done, sending file');
+      if (err) {
+        console.error('[ffmpeg] error:', stderr.slice(-2000));
+        try { fs.unlinkSync(outputPath); } catch {}
+        return res.status(500).json({ error: 'ffmpeg failed', details: stderr.slice(-2000) });
+      }
 
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Disposition', 'attachment; filename="output.mp4"');
+      const outStat = fs.statSync(outputPath);
+      console.log(`[ffmpeg] done, output size: ${(outStat.size / 1024 / 1024).toFixed(1)} MB`);
 
-    const stream = fs.createReadStream(outputPath);
-    stream.pipe(res);
-    stream.on('end', () => {
-      try { fs.unlinkSync(outputPath); } catch {}
-    });
-    stream.on('error', (e) => {
-      console.error('[stream] error:', e);
-      try { fs.unlinkSync(outputPath); } catch {}
+      res.setHeader('Content-Type', 'video/mp4');
+      res.setHeader('Content-Disposition', 'attachment; filename="output.mp4"');
+      res.setHeader('Content-Length', outStat.size);
+
+      const stream = fs.createReadStream(outputPath);
+      stream.pipe(res);
+      stream.on('end', () => { try { fs.unlinkSync(outputPath); } catch {} });
+      stream.on('error', (e) => {
+        console.error('[stream] error:', e);
+        try { fs.unlinkSync(outputPath); } catch {}
+      });
     });
   });
 });
