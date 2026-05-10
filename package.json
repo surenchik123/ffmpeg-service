@@ -1,7 +1,7 @@
 {
   "name": "ffmpeg-service",
-  "version": "2.0.0",
-  "description": "FFmpeg microservice: 9:16 crop, raw binary input",
+  "version": "3.0.0",
+  "description": "FFmpeg microservice: 9:16 crop, raw binary input, buffer response",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"

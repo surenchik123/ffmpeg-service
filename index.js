@@ -13,28 +13,27 @@ app.get('/health', (req, res) => {
 
 /**
  * POST /process
- * Content-Type: video/mp4 (или любой video/*)
- * Body: raw binary video file
- *
- * Возвращает MP4 1080x1920 (9:16, чёрные полосы)
+ * Body: raw binary video (any format ffmpeg supports)
+ * Returns: processed MP4 1080x1920 (9:16, black bars)
  */
 app.post('/process', (req, res) => {
   const tmpDir = os.tmpdir();
-  const inputPath = path.join(tmpDir, `in_${Date.now()}.mp4`);
-  const outputPath = path.join(tmpDir, `out_${Date.now()}.mp4`);
+  const ts = Date.now();
+  const inputPath = path.join(tmpDir, `in_${ts}.mp4`);
+  const outputPath = path.join(tmpDir, `out_${ts}.mp4`);
 
-  // Пишем входящий поток в файл
   const writeStream = fs.createWriteStream(inputPath);
   req.pipe(writeStream);
 
   writeStream.on('error', (err) => {
     console.error('[write] error:', err);
-    res.status(500).json({ error: 'Failed to write input file' });
+    cleanup(inputPath, outputPath);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to write input' });
   });
 
   writeStream.on('finish', () => {
     const stat = fs.statSync(inputPath);
-    console.log(`[ffmpeg] input size: ${(stat.size / 1024 / 1024).toFixed(1)} MB`);
+    console.log(`[ffmpeg] input: ${(stat.size / 1024 / 1024).toFixed(1)} MB`);
 
     const args = [
       '-y',
@@ -49,35 +48,47 @@ app.post('/process', (req, res) => {
       outputPath
     ];
 
-    console.log(`[ffmpeg] starting...`);
-
-    execFile('ffmpeg', args, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
-      try { fs.unlinkSync(inputPath); } catch {}
+    execFile('ffmpeg', args, { maxBuffer: 50 * 1024 * 1024 }, (err, _stdout, stderr) => {
+      cleanup(inputPath);
 
       if (err) {
-        console.error('[ffmpeg] error:', stderr.slice(-2000));
-        try { fs.unlinkSync(outputPath); } catch {}
-        return res.status(500).json({ error: 'ffmpeg failed', details: stderr.slice(-2000) });
+        console.error('[ffmpeg] failed:', stderr.slice(-1000));
+        cleanup(outputPath);
+        if (!res.headersSent) res.status(500).json({ error: 'ffmpeg failed', detail: stderr.slice(-500) });
+        return;
       }
 
       const outStat = fs.statSync(outputPath);
-      console.log(`[ffmpeg] done, output size: ${(outStat.size / 1024 / 1024).toFixed(1)} MB`);
+      console.log(`[ffmpeg] output: ${(outStat.size / 1024 / 1024).toFixed(1)} MB`);
 
-      res.setHeader('Content-Type', 'video/mp4');
-      res.setHeader('Content-Disposition', 'attachment; filename="output.mp4"');
-      res.setHeader('Content-Length', outStat.size);
+      // Читаем файл в память и отправляем как буфер — избегаем проблем с потоками в n8n
+      fs.readFile(outputPath, (readErr, data) => {
+        cleanup(outputPath);
 
-      const stream = fs.createReadStream(outputPath);
-      stream.pipe(res);
-      stream.on('end', () => { try { fs.unlinkSync(outputPath); } catch {} });
-      stream.on('error', (e) => {
-        console.error('[stream] error:', e);
-        try { fs.unlinkSync(outputPath); } catch {}
+        if (readErr) {
+          console.error('[read] error:', readErr);
+          if (!res.headersSent) res.status(500).json({ error: 'Failed to read output' });
+          return;
+        }
+
+        res.set({
+          'Content-Type': 'video/mp4',
+          'Content-Disposition': 'attachment; filename="output.mp4"',
+          'Content-Length': data.length,
+          'Connection': 'close'
+        });
+        res.end(data);
       });
     });
   });
 });
 
+function cleanup(...paths) {
+  for (const p of paths) {
+    try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch {}
+  }
+}
+
 app.listen(PORT, () => {
-  console.log(`ffmpeg-service listening on port ${PORT}`);
+  console.log(`ffmpeg-service v3 listening on port ${PORT}`);
 });
