@@ -1,7 +1,7 @@
 {
   "name": "ffmpeg-service",
-  "version": "4.0.0",
-  "description": "FFmpeg microservice: stdin/stdout pipe, no temp files",
+  "version": "5.0.0",
+  "description": "FFmpeg microservice: 9:16 crop, /app/tmp storage",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
