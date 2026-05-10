@@ -10,18 +10,17 @@ const TMP_DIR = path.join(__dirname, 'tmp');
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'ffmpeg-service', version: '8.0.0' });
+  res.json({ status: 'ok', service: 'ffmpeg-service', version: '9.0.0' });
 });
 
 /**
  * POST /process
  * Body: raw binary video
- * Returns: MP4 1080x1920 (9:16, fills full frame, sides cropped, top banners blurred)
+ * Returns: MP4 1080x1920 (9:16, fills full frame, sides cropped, no black bars)
  *
- * Filter pipeline:
- * 1. Blur top 12% of original (covers corner banners on Twitch streams)
- * 2. Scale by height to 1920px (fills vertically, width becomes ~3413px for 16:9)
- * 3. Crop center 1080px wide → full 9:16 frame, no black bars
+ * Minimal filter — no blur to avoid OOM on Railway free tier:
+ * 1. Scale height to 1920px (width ~3413px for 16:9)
+ * 2. Crop center 1080px wide → 1080x1920, no black bars
  */
 app.post('/process', (req, res) => {
   const ts = Date.now();
@@ -48,35 +47,25 @@ app.post('/process', (req, res) => {
       return res.status(400).json({ error: 'empty input file' });
     }
 
-    // Filter:
-    // 1. split → blur top 12% → overlay back
-    // 2. scale to height=1920, keep aspect (width will be ~3413 for 16:9 source)
-    // 3. crop 1080 wide from center → perfect 1080x1920 with no black bars
-    const vf = [
-      `[0:v]split=2[base][blur_src]`,
-      `[blur_src]crop=iw:ih*0.12:0:0,boxblur=30:6[blurred_top]`,
-      `[base][blurred_top]overlay=0:0[with_blur]`,
-      `[with_blur]scale=-2:1920[scaled]`,
-      `[scaled]crop=1080:1920[out]`
-    ].join(';');
+    // Simple vf: scale by height → crop center width
+    const vf = 'scale=-2:1920,crop=1080:1920';
 
     const args = [
       '-y',
       '-loglevel', 'warning',
       '-i', inputPath,
-      '-filter_complex', vf,
-      '-map', '[out]',
-      '-map', '0:a?',
+      '-vf', vf,
       '-c:v', 'libx264',
       '-preset', 'ultrafast',
-      '-crf', '26',
+      '-crf', '28',
       '-c:a', 'aac',
       '-b:a', '96k',
       '-movflags', '+faststart',
+      '-threads', '1',          // ограничиваем потоки чтобы снизить пик памяти
       outputPath
     ];
 
-    console.log(`[${ts}] starting ffmpeg (fill 9:16, blur banners)...`);
+    console.log(`[${ts}] starting ffmpeg (scale+crop only)...`);
 
     execFile('ffmpeg', args, {
       maxBuffer: 100 * 1024 * 1024,
@@ -133,6 +122,6 @@ function cleanup(...paths) {
 }
 
 app.listen(PORT, () => {
-  console.log(`ffmpeg-service v8 listening on port ${PORT}`);
+  console.log(`ffmpeg-service v9 listening on port ${PORT}`);
   console.log(`tmp dir: ${TMP_DIR}`);
 });
